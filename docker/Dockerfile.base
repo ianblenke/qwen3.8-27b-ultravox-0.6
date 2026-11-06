@@ -1,0 +1,11 @@
+# Ultravox training image on the NVIDIA PyTorch base (keeps its torch/CUDA/NCCL; nothing below may replace torch).
+FROM nvcr.io/nvidia/pytorch:26.07-py3
+ARG TRANSFORMERS_SPEC="transformers[torch]==4.57.3"
+ARG PEFT_SPEC="peft==0.17.1"
+RUN pip freeze | grep -E "^(torch|triton|numpy)==" > /tmp/constraints.txt && cat /tmp/constraints.txt
+RUN pip install --no-cache-dir -c /tmp/constraints.txt "${TRANSFORMERS_SPEC}" "${PEFT_SPEC}" accelerate \
+    simple-parsing librosa soundfile "datasets>=3.5.0,<4.0" mosaicml-streaming nltk truecase sentencepiece \
+    dataclasses-json openai jiwer tensorboardx wandb sacrebleu tenacity scipy einops praatio annoy \
+    whisper_normalizer langdetect evaluate huggingface_hub hf_xet requests rich protobuf
+ENV HF_HOME=/w/hf PYTHONPATH=/w/ultravox TOKENIZERS_PARALLELISM=false
+WORKDIR /w/ultravox

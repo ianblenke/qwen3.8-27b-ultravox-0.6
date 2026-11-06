@@ -1,0 +1,7 @@
+out/
+logs/
+hf/
+models/
+*.wav
+*.safetensors
+*.gguf

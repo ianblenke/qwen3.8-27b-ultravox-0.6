@@ -1,0 +1,2 @@
+FROM ultravox-train:tf457
+RUN pip install --no-cache-dir transformers==5.8.1 "peft>=0.19" && pip list 2>/dev/null | grep -iE "^(transformers|peft|accelerate) "

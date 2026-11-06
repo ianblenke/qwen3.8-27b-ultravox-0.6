@@ -1,0 +1,20 @@
+# measured plumbing check: ungated 1.1B Llama-architecture LLM, whisper-small, 50 steps on one Spark
+text_model: "/models/Qwen3.8-27B"
+audio_model: "openai/whisper-small"
+train_sets:
+  - name: librispeech-clean-continuation
+val_sets:
+  - name: librispeech-clean-continuation
+do_eval: false
+num_workers: 2
+save_steps: 0
+val_steps: 0
+max_steps: 20
+batch_size: 2
+logging_steps: 10
+lr: 2e-3
+lr_warmup_steps: 5
+train_dataset_args:
+  max_samples: 200
+  max_audio_duration_secs: 16
+report_logs_to: []

@@ -1,0 +1,24 @@
+# Run 1: projector-only baseline, 2 nodes x batch 4 (global 8), ~300k samples = 37,500 steps.
+# Rate measured at ~0.88 samples/s with this encoder => ~4 days (estimate for the full run).
+text_model: "/models/Qwen3.8-27B"
+audio_model: "openai/whisper-large-v3-turbo"
+train_sets:
+  - name: librispeech-clean-continuation
+  - name: librispeech-other-continuation
+  - name: commonvoice-en
+val_sets:
+  - name: librispeech-clean-continuation
+do_eval: false
+num_workers: 1
+val_steps: 0
+save_steps: 2000
+max_steps: 37500
+batch_size: 4
+logging_steps: 25
+lr: 2e-3
+lr_warmup_steps: 500
+lr_scheduler: cosine_with_min_lr
+train_dataset_args:
+  max_samples: 300000
+  max_audio_duration_secs: 16
+report_logs_to: []

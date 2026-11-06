@@ -1,0 +1,238 @@
+diff --git a/ultravox/data/datasets.py b/ultravox/data/datasets.py
+index 094867a..26528a6 100644
+--- a/ultravox/data/datasets.py
++++ b/ultravox/data/datasets.py
+@@ -1,4 +1,5 @@
+ import abc
++import glob
+ import logging
+ import os
+ import tempfile
+@@ -74,6 +75,30 @@ def _get_worker_info(length: int):
+     return num_workers, worker_id, worker_samples
+ 
+ 
++
++def _local_parquet_files(
++    path: str, name: Optional[str], split: Optional[str]
++) -> Optional[List[str]]:
++    """Local shards for (path, name, split) under $ULTRAVOX_LOCAL_HF_CACHE (a HF hub cache dir), else None."""
++    root = os.environ.get("ULTRAVOX_LOCAL_HF_CACHE")
++    if not root or not split:
++        return None
++    snaps = sorted(
++        glob.glob(
++            os.path.join(root, "datasets--" + path.replace("/", "--"), "snapshots", "*")
++        )
++    )
++    if not snaps:
++        return None
++    files = sorted(glob.glob(os.path.join(snaps[-1], name or "", f"{split}-*.parquet")))
++    if not files and os.environ.get("RANK", "0") != "0":
++        return None  # only rank 0 reads data; other ranks fall back to the Hub path (metadata only)
++    if not files:
++        raise FileNotFoundError(
++            f"ULTRAVOX_LOCAL_HF_CACHE set but no local shards for {path}/{name}/{split}"
++        )
++    return files
++
+ class SizedIterableDataset(abc.ABC, data.IterableDataset):
+     """
+     An interface for an IterableDataset that provides a length method.
+@@ -133,15 +158,22 @@ class VoiceDataset(SizedIterableDataset):
+         streaming: bool = True,
+         audio_field: Optional[str] = None,
+     ) -> data.Dataset:
+-        # HF datasets sometimes fails to download due to network issues, so retry a few times.
+-        dataset = hf_datasets.load_dataset(
+-            path,
+-            name,
+-            split=split,
+-            trust_remote_code=True,
+-            streaming=streaming,
+-            download_config=hf_datasets.DownloadConfig(max_retries=10),
+-        )
++        local_files = _local_parquet_files(path, name, split)
++        if local_files:
++            # Opt-in (ULTRAVOX_LOCAL_HF_CACHE): read already-downloaded parquet shards instead of streaming from the Hub.
++            dataset = hf_datasets.load_dataset(
++                "parquet", data_files=local_files, split="train", streaming=streaming
++            )
++        else:
++            # HF datasets sometimes fails to download due to network issues, so retry a few times.
++            dataset = hf_datasets.load_dataset(
++                path,
++                name,
++                split=split,
++                trust_remote_code=True,
++                streaming=streaming,
++                download_config=hf_datasets.DownloadConfig(max_retries=10),
++            )
+         if audio_field is not None:
+             dataset = dataset.cast_column(
+                 audio_field, hf_datasets.Audio(sampling_rate=data_sample.SAMPLE_RATE)
+diff --git a/ultravox/model/ultravox_config.py b/ultravox/model/ultravox_config.py
+index d69f18d..1a674e7 100644
+--- a/ultravox/model/ultravox_config.py
++++ b/ultravox/model/ultravox_config.py
+@@ -179,6 +179,8 @@ class UltravoxConfig(transformers.PretrainedConfig):
+         if hasattr(text_config, "text_config"):
+             text_config.vocab_size = text_config.text_config.vocab_size
+             text_config.hidden_size = text_config.text_config.hidden_size
++            if not hasattr(text_config, "initializer_range"):
++                text_config.initializer_range = text_config.text_config.initializer_range
+ 
+         self.vocab_size = text_config.vocab_size
+ 
+diff --git a/ultravox/model/ultravox_model.py b/ultravox/model/ultravox_model.py
+index 6dd6b8f..18b7299 100644
+--- a/ultravox/model/ultravox_model.py
++++ b/ultravox/model/ultravox_model.py
+@@ -1,4 +1,5 @@
+ import logging
++import os
+ import re
+ from typing import Any, Dict, Generator, Optional, Set, Tuple, TypeVar, Union
+ 
+@@ -67,9 +68,13 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
+         self.language_model = self._create_language_model(config)
+ 
+         if self.language_model._tied_weights_keys is not None:
+-            self._tied_weights_keys = [
+-                f"language_model.{k}" for k in self.language_model._tied_weights_keys
+-            ]
++            tied = self.language_model._tied_weights_keys
++            if isinstance(tied, dict):  # transformers 5: {tied_param: source_param}
++                self._tied_weights_keys = {
++                    f"language_model.{k}": f"language_model.{v}" for k, v in tied.items()
++                }
++            else:
++                self._tied_weights_keys = [f"language_model.{k}" for k in tied]
+ 
+         # Determine no_split_modules dynamically to use with FSDP auto_wrap policy.
+         # This would be something like ["LlamaDecoderLayer"] as we don't split audio encoder layers.
+@@ -127,8 +132,8 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
+     def get_decoder(self):
+         return self.language_model.get_decoder()
+ 
+-    def tie_weights(self):
+-        return self.language_model.tie_weights()
++    def tie_weights(self, *args, **kwargs):
++        return self.language_model.tie_weights(*args, **kwargs)
+ 
+     def set_loss_config(self, loss_config: LossConfig):
+         self.loss_config = loss_config
+@@ -444,7 +449,7 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
+         # But potentially other kwargs can be passed in. TODO
+         kwargs = {"torch_dtype": config.torch_dtype}
+         if (
+-            transformers.modeling_utils._init_weights
++            getattr(transformers.modeling_utils, "_init_weights", True)
+             and config.audio_model_id is not None
+         ):
+             if "whisper" in config.audio_model_id.lower():
+@@ -501,7 +506,7 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
+         cls, config: UltravoxConfig
+     ) -> transformers.LlamaForCausalLM:
+         if (
+-            transformers.modeling_utils._init_weights
++            getattr(transformers.modeling_utils, "_init_weights", True)
+             and config.text_model_id is not None
+         ):
+             language_model = transformers.AutoModelForCausalLM.from_pretrained(
+@@ -522,6 +527,11 @@ class UltravoxModel(transformers.LlamaPreTrainedModel, GenerationMixin):
+                     torch_dtype=config.torch_dtype,
+                 )
+ 
++        if os.environ.get("ULTRAVOX_LLM_GRAD_CKPT") == "1":
++            # recompute LLM activations in backward: needed to fit a 27B frozen LLM with projector-only training
++            language_model.gradient_checkpointing_enable(
++                gradient_checkpointing_kwargs={"use_reentrant": False}
++            )
+         language_model = apply_lora(language_model, config.text_model_lora_config)
+         return language_model
+ 
+@@ -919,11 +929,8 @@ class ModifiedWhisperEncoder(
+             attention_mask = torch.arange(max_seq_len, device=hidden_states.device)[
+                 None, :
+             ].lt(audio_feature_len.view(-1, 1))
+-            attention_mask = self.get_extended_attention_mask(
+-                attention_mask,
+-                None,
+-                dtype=hidden_states.dtype,
+-            )
++            # explicit (B, 1, 1, S) additive mask; same result as get_extended_attention_mask on transformers 4.x
++            attention_mask = (1.0 - attention_mask[:, None, None, :].to(hidden_states.dtype)) * torch.finfo(hidden_states.dtype).min
+ 
+         if self.audio_streaming_mask is not None:
+             seqlen = hidden_states.size(-2)
+@@ -959,22 +966,16 @@ class ModifiedWhisperEncoder(
+                         encoder_layer.__call__,
+                         hidden_states,
+                         attention_mask,
+-                        (head_mask[idx] if head_mask is not None else None),
+-                        output_attentions,
+                     )
+                 else:
+-                    layer_outputs = encoder_layer(
+-                        hidden_states,
+-                        attention_mask,
+-                        layer_head_mask=(
+-                            head_mask[idx] if head_mask is not None else None
+-                        ),
+-                        output_attentions=output_attentions,
+-                    )
++                    # transformers 5: layer takes (hidden_states, attention_mask) and returns a tensor
++                    layer_outputs = encoder_layer(hidden_states, attention_mask)
+ 
+-                hidden_states = layer_outputs[0]
++                hidden_states = (
++                    layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
++                )
+ 
+-            if output_attentions:
++            if output_attentions and isinstance(layer_outputs, tuple):
+                 all_attentions = all_attentions + (layer_outputs[1],)
+ 
+         hidden_states = self.layer_norm(hidden_states)
+diff --git a/ultravox/model/ultravox_processing.py b/ultravox/model/ultravox_processing.py
+index bd3fac3..3d98853 100644
+--- a/ultravox/model/ultravox_processing.py
++++ b/ultravox/model/ultravox_processing.py
+@@ -127,6 +127,10 @@ class UltravoxProcessor(transformers.ProcessorMixin):
+ 
+         super().__init__(audio_processor=audio_processor, tokenizer=tokenizer)
+ 
++    def check_argument_for_proper_class(self, argument_name, argument):
++        # transformers 5 requires a feature extractor here; this class deliberately holds a WhisperProcessor
++        return type(argument)
++
+     @classmethod
+     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+         config: UltravoxConfig = transformers.AutoConfig.from_pretrained(
+diff --git a/ultravox/training/helpers/prefetch_weights.py b/ultravox/training/helpers/prefetch_weights.py
+index a75a749..343e1c0 100644
+--- a/ultravox/training/helpers/prefetch_weights.py
++++ b/ultravox/training/helpers/prefetch_weights.py
+@@ -82,7 +82,7 @@ def download_model(model_id: str):
+         hf_hub_utils.download_hf_model(model_id)
+     except huggingface_hub.utils.GatedRepoError as e:
+         raise e
+-    except huggingface_hub.utils.RepositoryNotFoundError as e:
++    except (huggingface_hub.utils.RepositoryNotFoundError, huggingface_hub.errors.HFValidationError) as e:
+         # We assume that the model is local if it's not found on HF Hub.
+         # The `.from_pretrained` call will verify the local case.
+         print(f"Model {model_id} not found on HF Hub. Skipping download. Error: {e}")
+diff --git a/ultravox/training/train.py b/ultravox/training/train.py
+index 031c30d..eef4adc 100644
+--- a/ultravox/training/train.py
++++ b/ultravox/training/train.py
+@@ -337,7 +337,7 @@ def train(config: config_base.TrainConfig):
+         logging.info(f"train end time: {t_end}")
+         logging.info(f"elapsed: {t_end - t_start}")
+ 
+-    # save_final_model(trainer, model_pack, config)
++    save_final_model(trainer, model_pack, config)
+ 
+     # use fixie-ai/evals for evaluation if in use_fsdp mode
+     if config.do_eval:

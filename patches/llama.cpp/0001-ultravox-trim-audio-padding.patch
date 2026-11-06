@@ -1,0 +1,99 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 90de195..a21b514 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -5907,6 +5907,10 @@ bool clip_has_vision_encoder(const struct clip_ctx * ctx) {
+     return ctx->model.modality == CLIP_MODALITY_VISION;
+ }
+ 
++int clip_get_audio_stack_factor(const struct clip_ctx * ctx) {
++    return ctx->model.hparams.proj_stack_factor;
++}
++
+ bool clip_has_audio_encoder(const struct clip_ctx * ctx) {
+     return ctx->model.modality == CLIP_MODALITY_AUDIO;
+ }
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+index e07f258..d6ac5a7 100644
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -125,6 +125,7 @@ bool clip_is_llava(const struct clip_ctx * ctx);
+ 
+ bool clip_has_vision_encoder(const struct clip_ctx * ctx);
+ bool clip_has_audio_encoder(const struct clip_ctx * ctx);
++int  clip_get_audio_stack_factor(const struct clip_ctx * ctx); // 0 if the audio projector does not stack frames
+ 
+ bool clip_support_batch(const struct clip_ctx * ctx);
+ 
+diff --git a/tools/mtmd/mtmd-audio.cpp b/tools/mtmd/mtmd-audio.cpp
+index ce08f9e..dc907cd 100644
+--- a/tools/mtmd/mtmd-audio.cpp
++++ b/tools/mtmd/mtmd-audio.cpp
+@@ -605,7 +605,8 @@ bool mtmd_audio_preprocessor_whisper::preprocess(const float *                 s
+         mtmd_audio_mel out_chunk;
+         out_chunk.n_len     = n_len;
+         out_chunk.n_mel     = out_full.n_mel;
+-        out_chunk.n_len_org = out_full.n_mel;  // unused
++        // number of mel frames in this window that come from real audio (the rest is silence padding)
++        out_chunk.n_len_org = std::min<int64_t>(n_len, std::max<int64_t>(0, (int64_t)(n_samples / hparams.audio_hop_len) - (int64_t)off));
+         out_chunk.data.reserve((size_t)out_chunk.n_mel * (size_t)out_chunk.n_len);
+ 
+         for (int64_t i = 0; i < out_full.n_mel; i++) {
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 5b30618..75167c6 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -518,6 +518,7 @@ struct mtmd_context {
+     std::string sli_img_start_tmpl;
+ 
+     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
++    bool audio_trim_padding = false; // keep only the embeddings that cover real audio
+     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
+ 
+     // batching
+@@ -948,6 +949,11 @@ struct mtmd_context {
+                     audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
+                 } break;
+             case PROJECTOR_TYPE_ULTRAVOX:
++                {
++                    // Ultravox trains on embeddings trimmed to the real audio length, so drop the padding positions
++                    audio_trim_padding = true;
++                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_whisper>(ctx_a);
++                } break;
+             case PROJECTOR_TYPE_GLMA:
+             case PROJECTOR_TYPE_MERALION:
+                 {
+@@ -1578,6 +1584,13 @@ struct mtmd_tokenizer {
+                 mel_f32.cpy_buf(mel_spec.data);
+ 
+                 size_t n_tokens = clip_n_output_tokens(ctx->ctx_a, &mel_f32);
++                if (ctx->audio_trim_padding && !is_placeholder) {
++                    // same length rule as the HF Ultravox processor: ceil(ceil(frames / 2) / stack_factor)
++                    const int64_t stack = std::max(1, clip_get_audio_stack_factor(ctx->ctx_a));
++                    const int64_t enc_frames = mel_spec.n_len_org > 0 ? (mel_spec.n_len_org - 1) / 2 + 1 : 0;
++                    const size_t n_valid = (size_t)std::max<int64_t>(1, (enc_frames + stack - 1) / stack);
++                    n_tokens = std::min(n_tokens, n_valid);
++                }
+ 
+                 clip_image_f32_batch batch_f32;
+                 batch_f32.is_audio = true;
+@@ -1765,12 +1778,18 @@ static int32_t mtmd_encode_chunk_impl(mtmd_context * ctx, const mtmd_input_chunk
+             return 1;
+         }
+         int n_mmproj_embd = ctx->n_embd_out();
+-        out_embd.resize((size_t)chunk->tokens_audio->n_tokens * n_mmproj_embd);
++        const auto & audio_entries = chunk->tokens_audio->batch_f32.entries;
++        size_t n_tokens_enc = chunk->tokens_audio->n_tokens;
++        if (ctx->audio_trim_padding && audio_entries.size() == 1) {
++            n_tokens_enc = std::max(n_tokens_enc, (size_t)clip_n_output_tokens(ctx->ctx_a, &audio_entries[0]));
++        }
++        out_embd.resize(n_tokens_enc * n_mmproj_embd);
+         bool ok = clip_image_batch_encode(
+             ctx->ctx_a,
+             ctx->n_threads,
+             &chunk->tokens_audio->batch_f32,
+             out_embd);
++        out_embd.resize((size_t)chunk->tokens_audio->n_tokens * n_mmproj_embd); // drop the trimmed padding positions
+         return ok ? 0 : 1;
+     }
+ 
